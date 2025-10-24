@@ -1,27 +1,33 @@
-use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
 use color_eyre::eyre::ContextCompat;
 use color_eyre::{Result, eyre::Context};
+use hmac::{Hmac, Mac};
+use jwt::SignWithKey;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+use subtle::ConstantTimeEq;
 
 /// Name of the header set by the reverse proxy containing the ID of the authenticated user, if
 /// any, or not set otherwise.
 const AUTH_HEADER_NAME: &str = "x-webauth-user";
+/// The domain (well, really the URL) on which this OICD provider is being served.
+const DOMAIN: &str = "https://oauth.example.com";
 
 #[derive(Deserialize, Debug)]
 struct ClientConfig {
     redirect_uris: Vec<String>,
+    client_secret: String,
 }
 
-#[allow(unused, reason = "Used in next commit.")]
 struct TokenState {
     user_id: String,
 }
@@ -32,6 +38,8 @@ struct AppState {
     clients: std::collections::HashMap<String, ClientConfig>,
     /// Map from (token, client ID) to the active user.
     tokens: Mutex<std::collections::HashMap<(String, String), TokenState>>,
+    /// Secret key used to sign JWT tokens.
+    jwt_hmac: Hmac<sha2::Sha256>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -91,28 +99,105 @@ async fn handle_authorize(
         .unwrap()
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct TokenArgs {
+    grant_type: String,
+    code: String,
+    client_id: String,
+    client_secret: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct JwtClaims {
+    sub: String,
+    iss: String,
+    aud: String,
+    iat: u64,
+    exp: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenResponse<'a> {
+    access_token: String,
+    token_type: &'a str,
+    expires_in: u64,
+}
+
+async fn handle_token(
+    State(state): State<Arc<AppState>>,
+    form: axum::extract::Form<TokenArgs>,
+) -> axum::response::Response {
+    if form.grant_type != "authorization_code" {
+        return (StatusCode::BAD_REQUEST, "Invalid grant_type").into_response();
+    }
+
+    let client_config = match state.clients.get(&form.client_id) {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, "Invalid client_id").into_response(),
+    };
+    if client_config
+        .client_secret
+        .as_bytes()
+        .ct_ne(form.client_secret.as_bytes())
+        .into()
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid client_secret").into_response();
+    }
+    let token_key = (form.code.clone(), form.client_id.clone());
+    let token_state = match state.tokens.lock().unwrap().remove(&token_key) {
+        Some(state) => state,
+        None => return (StatusCode::BAD_REQUEST, "Invalid code").into_response(),
+    };
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let expiry = Duration::from_secs(60);
+    let claims = JwtClaims {
+        sub: token_state.user_id,
+        iss: DOMAIN.to_string(),
+        aud: form.client_id.clone(),
+        iat: now.as_secs(),
+        exp: (now + expiry).as_secs(),
+    };
+
+    Json(TokenResponse {
+        access_token: claims.sign_with_key(&state.jwt_hmac).unwrap(),
+        token_type: "Bearer",
+        expires_in: expiry.as_secs(),
+    })
+    .into_response()
+}
+
 fn load_config(path: &str) -> Result<std::collections::HashMap<String, ClientConfig>> {
     let file = File::open(path).wrap_err_with(|| format!("Failed to open config {}", path))?;
     let reader = BufReader::new(file);
     serde_json::from_reader(reader).wrap_err_with(|| format!("Failed to parse config {}", path))
 }
 
-fn app_from_config_path(config_path: &str) -> Result<Router> {
+fn app_from_config_path(config_path: &str) -> Result<(Router, Arc<AppState>)> {
     let config = load_config(config_path)?;
     let app_state = Arc::new(AppState {
         clients: config,
         tokens: Mutex::new(std::collections::HashMap::new()),
+        // Use a new signing secret every time the server starts. We never expect tokens to be used
+        // for any longer than a few seconds at most.
+        jwt_hmac: Hmac::new_from_slice(url_safe_token().as_bytes()).unwrap(),
     });
-    Ok(axum::Router::new()
-        .route("/authorize", axum::routing::get(handle_authorize))
-        .with_state(app_state))
+    Ok((
+        axum::Router::new()
+            .route("/authorize", axum::routing::get(handle_authorize))
+            .route("/token", axum::routing::post(handle_token))
+            .with_state(app_state.clone()),
+        app_state,
+    ))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let app = app_from_config_path("./config.json")?;
+    let (app, _) = app_from_config_path("./config.json")?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:7743")
         .await
         .unwrap();
@@ -125,6 +210,7 @@ mod tests {
     use asserting::{assert_that, prelude::AssertStringPattern};
     use axum::http::StatusCode;
     use axum_test::TestServer;
+    use jwt::VerifyWithKey;
 
     /// Applies request/response modifications done by our reverse proxy.
     async fn proxy(request: axum_test::TestRequest) -> axum_test::TestResponse {
@@ -156,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_returns_redirect_with_code_and_state() {
-        let app = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config_path("./config.json").unwrap();
         let server = TestServer::new(app).unwrap();
 
         let args = valid_authorize_args();
@@ -171,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_returns_different_code_each_time() {
-        let app = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config_path("./config.json").unwrap();
         let server = TestServer::new(app).unwrap();
 
         let args = valid_authorize_args();
@@ -187,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_rejects_unknown_client_id() {
-        let app = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config_path("./config.json").unwrap();
         let server = TestServer::new(app).unwrap();
 
         let response = proxy(server.get("/authorize").add_query_params(AuthorizeArgs {
@@ -202,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_rejects_unknown_redirect_uri() {
-        let app = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config_path("./config.json").unwrap();
         let server = TestServer::new(app).unwrap();
 
         let response = proxy(server.get("/authorize").add_query_params(AuthorizeArgs {
@@ -217,19 +303,131 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_fails_on_missing_auth_header() {
-        let app = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config_path("./config.json").unwrap();
         let server = TestServer::new(app).unwrap();
 
         let response = server
             .get("/authorize")
-            .add_query_params(&AuthorizeArgs {
-                client_id: "foo-client".to_string(),
-                redirect_uri: "https://example.com/1".to_string(),
-                state: "foo-state".to_string(),
-            })
+            .add_query_params(valid_authorize_args())
             .await;
 
         response.assert_status_internal_server_error();
         response.assert_text("Missing x-webauth-user header");
+    }
+
+    /// Returns /token args that match the hardcoded config (except for code).
+    fn valid_token_args() -> TokenArgs {
+        TokenArgs {
+            grant_type: "authorization_code".to_string(),
+            code: "default from _valid_token_args()".to_string(),
+            client_id: "foo-client".to_string(),
+            client_secret: "hunter2".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_signed_token_can_be_retrieved_after_authorize_call() {
+        let (app, app_state) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+        let (_, authorize_response_params) = parse_authorize_response(
+            proxy(
+                server
+                    .get("/authorize")
+                    .add_query_params(valid_authorize_args()),
+            )
+            .await,
+        );
+        let code = authorize_response_params.get("code").unwrap();
+
+        let token_response = server
+            .post("/token")
+            .form(&TokenArgs {
+                code: code.to_string(),
+                ..valid_token_args()
+            })
+            .await;
+
+        token_response.assert_status_ok();
+        let token_response_bytes = token_response.into_bytes();
+        let token_json: TokenResponse = serde_json::from_slice(&token_response_bytes).unwrap();
+        assert_eq!(token_json.token_type, "Bearer");
+        assert_eq!(token_json.expires_in, 60);
+
+        let claims: JwtClaims = token_json
+            .access_token
+            .verify_with_key(&app_state.jwt_hmac)
+            .unwrap();
+        assert_eq!(claims.iss, DOMAIN);
+        assert_eq!(claims.sub, "alice@example.com");
+        assert_eq!(claims.aud, "foo-client");
+        assert_eq!(claims.exp - claims.iat, 60);
+    }
+
+    #[tokio::test]
+    async fn test_token_rejects_unrecognized_grant_type() {
+        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+
+        let token_response = server
+            .post("/token")
+            .form(&TokenArgs {
+                grant_type: "bad-grant-type".to_string(),
+                ..valid_token_args()
+            })
+            .await;
+
+        token_response.assert_status_bad_request();
+        token_response.assert_text("Invalid grant_type");
+    }
+
+    #[tokio::test]
+    async fn test_token_rejects_unrecognized_authorize_code() {
+        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+
+        let token_response = server
+            .post("/token")
+            .form(&TokenArgs {
+                code: "bad-code".to_string(),
+                ..valid_token_args()
+            })
+            .await;
+
+        token_response.assert_status_bad_request();
+        token_response.assert_text("Invalid code");
+    }
+
+    #[tokio::test]
+    async fn test_token_rejects_unrecognized_client_id() {
+        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+
+        let token_response = server
+            .post("/token")
+            .form(&TokenArgs {
+                client_id: "unknown-client".to_string(),
+                ..valid_token_args()
+            })
+            .await;
+
+        token_response.assert_status_bad_request();
+        token_response.assert_text("Invalid client_id");
+    }
+
+    #[tokio::test]
+    async fn test_token_rejects_unrecognized_client_secret() {
+        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+
+        let token_response = server
+            .post("/token")
+            .form(&TokenArgs {
+                client_secret: "wrong secret".to_string(),
+                ..valid_token_args()
+            })
+            .await;
+
+        token_response.assert_status_bad_request();
+        token_response.assert_text("Invalid client_secret");
     }
 }
