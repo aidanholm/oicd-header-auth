@@ -1,0 +1,9 @@
+{
+	"foo-client": {
+		"client_secret": "hunter2",
+		"redirect_uris": [
+			"https://example.com/1",
+			"https://example.com/2"
+		]
+	}
+}
