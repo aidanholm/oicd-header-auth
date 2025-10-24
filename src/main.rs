@@ -2,12 +2,17 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Json, Router};
+use axum_extra::{
+    TypedHeader,
+    headers::{Authorization, authorization::Bearer},
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
 use color_eyre::eyre::ContextCompat;
 use color_eyre::{Result, eyre::Context};
 use hmac::{Hmac, Mac};
 use jwt::SignWithKey;
+use jwt::VerifyWithKey;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -169,6 +174,27 @@ async fn handle_token(
     .into_response()
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Userinfo {
+    sub: String,
+    email: String,
+}
+
+async fn handle_userinfo(
+    State(state): State<Arc<AppState>>,
+    TypedHeader(authorization): TypedHeader<Authorization<Bearer>>,
+) -> axum::response::Response {
+    let claims: JwtClaims = match authorization.token().verify_with_key(&state.jwt_hmac) {
+        Ok(claims) => claims,
+        Err(e) => return (StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+    };
+    Json(Userinfo {
+        sub: claims.sub.clone(),
+        email: claims.sub,
+    })
+    .into_response()
+}
+
 fn load_config(path: &str) -> Result<std::collections::HashMap<String, ClientConfig>> {
     let file = File::open(path).wrap_err_with(|| format!("Failed to open config {}", path))?;
     let reader = BufReader::new(file);
@@ -188,6 +214,7 @@ fn app_from_config_path(config_path: &str) -> Result<(Router, Arc<AppState>)> {
         axum::Router::new()
             .route("/authorize", axum::routing::get(handle_authorize))
             .route("/token", axum::routing::post(handle_token))
+            .route("/userinfo", axum::routing::get(handle_userinfo))
             .with_state(app_state.clone()),
         app_state,
     ))
@@ -210,7 +237,6 @@ mod tests {
     use asserting::{assert_that, prelude::AssertStringPattern};
     use axum::http::StatusCode;
     use axum_test::TestServer;
-    use jwt::VerifyWithKey;
 
     /// Applies request/response modifications done by our reverse proxy.
     async fn proxy(request: axum_test::TestRequest) -> axum_test::TestResponse {
@@ -429,5 +455,58 @@ mod tests {
 
         token_response.assert_status_bad_request();
         token_response.assert_text("Invalid client_secret");
+    }
+
+    #[tokio::test]
+    async fn test_userinfo_returns_userinfo_given_token() {
+        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+        let (_, authorize_response_params) = parse_authorize_response(
+            proxy(
+                server
+                    .get("/authorize")
+                    .add_query_params(valid_authorize_args()),
+            )
+            .await,
+        );
+        let code = authorize_response_params.get("code").unwrap();
+
+        let token_response = server
+            .post("/token")
+            .form(&TokenArgs {
+                code: code.to_string(),
+                ..valid_token_args()
+            })
+            .await;
+        token_response.assert_status_ok();
+        let token_response_bytes = token_response.into_bytes();
+        let token = serde_json::from_slice::<TokenResponse>(&token_response_bytes)
+            .unwrap()
+            .access_token;
+
+        let userinfo_response = proxy(
+            server
+                .get("/userinfo")
+                .add_header("authorization", format!("Bearer {token}")),
+        )
+        .await;
+        userinfo_response.assert_json(&Userinfo {
+            sub: "alice@example.com".to_string(),
+            email: "alice@example.com".to_string(),
+        });
+    }
+
+    #[tokio::test]
+    async fn test_userinfo_rejects_bad_token() {
+        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+
+        let userinfo_response = proxy(
+            server
+                .get("/userinfo")
+                .add_header("authorization", "Bearer bad-token"),
+        )
+        .await;
+        userinfo_response.assert_status(StatusCode::UNAUTHORIZED);
     }
 }
