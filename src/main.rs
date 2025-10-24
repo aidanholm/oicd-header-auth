@@ -195,6 +195,36 @@ async fn handle_userinfo(
     .into_response()
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct OpenIdConfig {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    userinfo_endpoint: String,
+    scopes_supported: Vec<String>,
+    response_types_supported: Vec<String>,
+    grant_types_supported: Vec<String>,
+    subject_types_supported: Vec<String>,
+    id_token_signing_alg_values_supported: Vec<String>,
+    token_endpoint_auth_methods_supported: Vec<String>,
+}
+
+async fn handle_openid_config() -> axum::response::Response {
+    Json(OpenIdConfig {
+        issuer: DOMAIN.into(),
+        authorization_endpoint: format!("{DOMAIN}/authorize"),
+        token_endpoint: format!("{DOMAIN}/token"),
+        userinfo_endpoint: format!("{DOMAIN}/userinfo"),
+        scopes_supported: vec!["openid".into(), "profile".into(), "email".into()],
+        response_types_supported: vec!["code".into()],
+        grant_types_supported: vec!["authorization_code".into()],
+        subject_types_supported: vec!["public".into()],
+        id_token_signing_alg_values_supported: vec!["HS256".into()],
+        token_endpoint_auth_methods_supported: vec!["client_secret_post".into()],
+    })
+    .into_response()
+}
+
 fn load_config(path: &str) -> Result<std::collections::HashMap<String, ClientConfig>> {
     let file = File::open(path).wrap_err_with(|| format!("Failed to open config {}", path))?;
     let reader = BufReader::new(file);
@@ -215,6 +245,10 @@ fn app_from_config_path(config_path: &str) -> Result<(Router, Arc<AppState>)> {
             .route("/authorize", axum::routing::get(handle_authorize))
             .route("/token", axum::routing::post(handle_token))
             .route("/userinfo", axum::routing::get(handle_userinfo))
+            .route(
+                "/.well-known/openid-configuration",
+                axum::routing::get(handle_openid_config),
+            )
             .with_state(app_state.clone()),
         app_state,
     ))
@@ -508,5 +542,25 @@ mod tests {
         )
         .await;
         userinfo_response.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_openid_config_serves_config() {
+        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let server = TestServer::new(app).unwrap();
+
+        let response = proxy(server.get("/.well-known/openid-configuration")).await;
+        response.assert_json(&OpenIdConfig {
+            issuer: "https://oauth.example.com".into(),
+            authorization_endpoint: "https://oauth.example.com/authorize".into(),
+            token_endpoint: "https://oauth.example.com/token".into(),
+            userinfo_endpoint: "https://oauth.example.com/userinfo".into(),
+            scopes_supported: vec!["openid".into(), "profile".into(), "email".into()],
+            response_types_supported: vec!["code".into()],
+            grant_types_supported: vec!["authorization_code".into()],
+            subject_types_supported: vec!["public".into()],
+            id_token_signing_alg_values_supported: vec!["HS256".into()],
+            token_endpoint_auth_methods_supported: vec!["client_secret_post".into()],
+        });
     }
 }
