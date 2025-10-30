@@ -15,8 +15,6 @@ use jwt::SignWithKey;
 use jwt::VerifyWithKey;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use subtle::ConstantTimeEq;
@@ -225,14 +223,12 @@ async fn handle_openid_config() -> axum::response::Response {
     .into_response()
 }
 
-fn load_config(path: &str) -> Result<std::collections::HashMap<String, ClientConfig>> {
-    let file = File::open(path).wrap_err_with(|| format!("Failed to open config {}", path))?;
-    let reader = BufReader::new(file);
-    serde_json::from_reader(reader).wrap_err_with(|| format!("Failed to parse config {}", path))
+fn load_config() -> std::collections::HashMap<String, ClientConfig> {
+    serde_json::from_str(include_str!("./config.json")).unwrap()
 }
 
-fn app_from_config_path(config_path: &str) -> Result<(Router, Arc<AppState>)> {
-    let config = load_config(config_path)?;
+fn app_from_config() -> (Router, Arc<AppState>) {
+    let config = load_config();
     let app_state = Arc::new(AppState {
         clients: config,
         tokens: Mutex::new(std::collections::HashMap::new()),
@@ -240,7 +236,7 @@ fn app_from_config_path(config_path: &str) -> Result<(Router, Arc<AppState>)> {
         // for any longer than a few seconds at most.
         jwt_hmac: Hmac::new_from_slice(url_safe_token().as_bytes()).unwrap(),
     });
-    Ok((
+    (
         axum::Router::new()
             .route("/authorize", axum::routing::get(handle_authorize))
             .route("/token", axum::routing::post(handle_token))
@@ -251,14 +247,14 @@ fn app_from_config_path(config_path: &str) -> Result<(Router, Arc<AppState>)> {
             )
             .with_state(app_state.clone()),
         app_state,
-    ))
+    )
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let (app, _) = app_from_config_path("./config.json")?;
+    let (app, _) = app_from_config();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:7743")
         .await
         .unwrap();
@@ -302,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_returns_redirect_with_code_and_state() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let args = valid_authorize_args();
@@ -317,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_returns_different_code_each_time() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let args = valid_authorize_args();
@@ -333,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_rejects_unknown_client_id() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let response = proxy(server.get("/authorize").add_query_params(AuthorizeArgs {
@@ -348,7 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_rejects_unknown_redirect_uri() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let response = proxy(server.get("/authorize").add_query_params(AuthorizeArgs {
@@ -363,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_fails_on_missing_auth_header() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let response = server
@@ -387,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_signed_token_can_be_retrieved_after_authorize_call() {
-        let (app, app_state) = app_from_config_path("./config.json").unwrap();
+        let (app, app_state) = app_from_config();
         let server = TestServer::new(app).unwrap();
         let (_, authorize_response_params) = parse_authorize_response(
             proxy(
@@ -425,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_rejects_unrecognized_grant_type() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let token_response = server
@@ -442,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_rejects_unrecognized_authorize_code() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let token_response = server
@@ -459,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_rejects_unrecognized_client_id() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let token_response = server
@@ -476,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_rejects_unrecognized_client_secret() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let token_response = server
@@ -493,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_userinfo_returns_userinfo_given_token() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
         let (_, authorize_response_params) = parse_authorize_response(
             proxy(
@@ -532,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_userinfo_rejects_bad_token() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let userinfo_response = proxy(
@@ -546,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_openid_config_serves_config() {
-        let (app, _) = app_from_config_path("./config.json").unwrap();
+        let (app, _) = app_from_config();
         let server = TestServer::new(app).unwrap();
 
         let response = proxy(server.get("/.well-known/openid-configuration")).await;
