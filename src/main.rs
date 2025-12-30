@@ -24,6 +24,9 @@ use subtle::ConstantTimeEq;
 const AUTH_HEADER_NAME: &str = "x-webauth-user";
 /// The domain (well, really the URL) on which this OICD provider is being served.
 const DOMAIN: &str = "https://oauth.example.com";
+/// The address and port on which to listen. Uses 127.0.0.1 as this is expected to run on the same
+/// machine as the reverse proxy. Adjust to 0.0.0.0 if running in a container, etc.
+const LISTEN_ADDR: &str = "127.0.0.1:7743";
 
 #[derive(Deserialize, Debug)]
 struct ClientConfig {
@@ -255,9 +258,7 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     let (app, _) = app_from_config();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:7743")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(LISTEN_ADDR).await.unwrap();
     Ok(axum::serve(listener, app).await?)
 }
 
